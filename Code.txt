@@ -1,0 +1,473 @@
+using System.Collections.Generic;
+using JetBrains.Annotations;
+using Unity.Collections;
+using UnityEditor;
+using UnityEngine;
+
+
+[System.Serializable]
+public enum FaceType
+{
+    SameAround,
+    Different
+}
+
+[System.Serializable]
+public class BlockInfo
+{
+    public string blockName;
+    public FaceType faceType;
+    public int sameTextureID; // Utilisé si faceType == Same
+    public int[] faceTextureIDs = new int[6]; 
+}
+
+public class World : MonoBehaviour
+{
+    [Header("Mesh Settings")] public MeshFilter meshFilter;
+    public MeshRenderer meshRenderer;
+    public MeshCollider meshCollider;
+    [Header("Chunk Settings")] public int ChunkSize;
+    public int ChunkHeight;
+    public int chunkNbrXY;
+    public int chunkNbrZ;
+    public Material chunkMaterial;
+    [Header("LOD Settings")] public int lodStepDistance = 50; // tous les 50 blocs, on augmente le LOD
+    public int maxLOD = 16; // LOD maximum (16 = bloc de 16x16x16)
+    [Header("Player Utils Settings")] public Transform PlayerTransform;
+
+    [Header("World Settings")] [Tooltip("Unusable for now")]
+    public int PerlinSeed = 0;
+
+    [Tooltip("Keep between 0.001 and 0.01")]
+    public float PerlinOffset = 0f;
+
+    [Tooltip("never beyond the Chunk Height")]
+    public int PerlinScale = 0;
+
+    [Header("Blocks Settings")] public BlockInfo[] blocks;
+
+
+
+
+
+    private System.Random rand;
+    private float perlinOffsetX;
+    private float perlinOffsetZ;
+
+    private Dictionary<Vector3Int, int[]> chunks = new Dictionary<Vector3Int, int[]>();
+    private List<Vector2> uvs = new List<Vector2>();
+
+
+    private Vector3[] voxelVerts =
+    {
+        new Vector3(0, 0, 0),
+        new Vector3(1, 0, 0),
+        new Vector3(1, 1, 0),
+        new Vector3(0, 1, 0),
+        new Vector3(0, 1, 1),
+        new Vector3(1, 1, 1),
+        new Vector3(1, 0, 1),
+        new Vector3(0, 0, 1),
+    };
+
+    private Vector3[] faceChecks =
+    {
+        new Vector3(0, 0, -1),
+        new Vector3(0, 0, 1),
+        new Vector3(-1, 0, 0),
+        new Vector3(1, 0, 0),
+        new Vector3(0, 1, 0),
+        new Vector3(0, -1, 0)
+    };
+
+    private int[][] voxelTris =
+    {
+        new int[] { 0, 3, 2, 1 }, // back
+        new int[] { 6, 5, 4, 7 }, // front
+        new int[] { 7, 4, 3, 0 },
+        new int[] { 1, 2, 5, 6 },
+        new int[] { 3, 4, 5, 2 },
+        new int[] { 1, 6, 7, 0 }
+    };
+
+    void Start()
+    {
+        rand = new System.Random(PerlinSeed);
+        perlinOffsetX = rand.Next(-100000, 100000);
+        perlinOffsetZ = rand.Next(-100000, 100000);
+
+
+        CoordinateChunks();
+        Vector3 centerPos = new Vector3(
+            (chunkNbrXY * ChunkSize) / 2f,
+            (chunkNbrZ * ChunkHeight),
+            (chunkNbrXY * ChunkSize) / 2f
+        );
+
+        PlayerTransform.transform.position = centerPos;
+
+    }
+
+    void Update()
+    {
+
+    }
+
+    void CoordinateChunks()
+    {
+        for (int x = 0; x < chunkNbrXY; x++)
+        {
+            for (int y = 0; y < chunkNbrZ; y++)
+            {
+                for (int z = 0; z < chunkNbrXY; z++)
+                {
+
+                    Vector3Int chkPos = new Vector3Int(x * ChunkSize, y * ChunkHeight, z * ChunkSize);
+
+                    GenerateChunkData(chkPos);
+
+                }
+            }
+        }
+
+        foreach (Vector3Int pos in chunks.Keys)
+        {
+
+            GenerateMesh(pos, 1);
+
+        }
+    }
+
+
+
+
+    void GenerateChunkData(Vector3Int chkPos)
+    {
+        int[] chunkInnerData = new int[ChunkSize * ChunkHeight * ChunkSize];
+
+        for (int x = 0; x < ChunkSize; x++)
+        {
+            for (int z = 0; z < ChunkSize; z++)
+            {
+                for (int y = 0; y < ChunkHeight; y++)
+                {
+                    int globalX = chkPos.x + ChunkSize + x;
+                    int globalY = chkPos.y + ChunkSize + y;
+                    int globalZ = chkPos.z + ChunkSize + z;
+
+                    float height = Mathf.Pow(2,
+                        Mathf.PerlinNoise((globalX + perlinOffsetX) * PerlinOffset,
+                            (globalZ + perlinOffsetZ) * PerlinOffset) * PerlinScale);
+
+
+                    int index = x + y * ChunkSize + z * ChunkSize * ChunkHeight;
+                    int worldY = chkPos.y + y;
+                    chunkInnerData[index] = (worldY <= height) ? 1 : 0;
+                }
+            }
+        }
+
+        chunks[chkPos] = chunkInnerData;
+
+    }
+
+    void GenerateMesh(Vector3Int chkPos, int VoxelSize)
+    {
+        List<Vector3> vertices = new List<Vector3>();
+        List<int> triangles = new List<int>();
+        int vertexCount = 0;
+        uvs.Clear(); // Clear les UVs au début de GenerateMesh
+
+        Vector3Int chunkSize = new Vector3Int(ChunkSize, ChunkHeight, ChunkSize);
+
+        // Directions (axis = 0:x, 1:y, 2:z)
+        for (int d = 0; d < 3; d++)
+        {
+            int u = (d + 1) % 3;
+            int v = (d + 2) % 3;
+
+            Vector3Int size = new Vector3Int(chunkSize[u], chunkSize[v], chunkSize[d]);
+
+            int[] x = new int[3];
+            int[] q = new int[3];
+            q[d] = 1;
+
+            int[,] mask = new int[size.x, size.y];
+
+            for (x[d] = -1; x[d] < size.z;)
+            {
+                int z = x[d];
+                x[d]++;
+                for (x[u] = 0; x[u] < size.x; x[u]++)
+                {
+                    for (x[v] = 0; x[v] < size.y; x[v]++)
+                    {
+                        int voxel1 = GetVoxel3D(x[0], x[1], x[2], chkPos);
+                        int voxel2 = GetVoxel3D(x[0] - q[0], x[1] - q[1], x[2] - q[2], chkPos);
+
+                        mask[x[u], x[v]] = 0;
+
+                        if ((voxel1 != 0 && voxel2 == 0))
+                            mask[x[u], x[v]] = voxel1;
+                        else if ((voxel2 != 0 && voxel1 == 0))
+                            mask[x[u], x[v]] = -voxel2;
+                    }
+                }
+
+                // Appliquer le greedy meshing sur le masque
+                for (int j = 0; j < size.y; j++)
+                {
+                    for (int i = 0; i < size.x;)
+                    {
+                        int c = mask[i, j];
+                        if (c != 0)
+                        {
+                            int w, h;
+                            for (w = 1; i + w < size.x && mask[i + w, j] == c; w++) ;
+                            for (h = 1; j + h < size.y; h++)
+                            {
+                                for (int k = 0; k < w; k++)
+                                {
+                                    if (mask[i + k, j + h] != c)
+                                    {
+                                        goto Done;
+                                    }
+                                }
+                            }
+
+                            Done:
+
+                            x[u] = i;
+                            x[v] = j;
+
+                            int[] du = new int[3];
+                            int[] dv = new int[3];
+
+                            du[u] = w;
+                            dv[v] = h;
+
+                            Vector3 pos = new Vector3(x[0], x[1], x[2]) * VoxelSize;
+                            Vector3 duVec = new Vector3(du[0], du[1], du[2]) * VoxelSize;
+                            Vector3 dvVec = new Vector3(dv[0], dv[1], dv[2]) * VoxelSize;
+
+                            // Inverser si nécessaire
+                            bool backFace = c < 0;
+                            c = Mathf.Abs(c);
+
+                            AddQuad(vertices, triangles, ref vertexCount,
+                                chkPos + pos,
+                                duVec,
+                                dvVec,
+                                backFace
+                            );
+
+                            // Réinitialiser le masque pour cette zone
+                            for (int l = 0; l < h; l++)
+                            for (int k = 0; k < w; k++)
+                                mask[i + k, j + l] = 0;
+
+                            i += w;
+                        }
+                        else i++;
+                    }
+                }
+            }
+        }
+
+        // Création du GameObject et assignation du Mesh
+        GameObject chunkObject = new GameObject($"Chunk_{chkPos.x}_{chkPos.y}_{chkPos.z}_LOD{VoxelSize}");
+        chunkObject.transform.parent = transform;
+
+        Mesh mesh = new Mesh();
+        mesh.vertices = vertices.ToArray();
+        mesh.triangles = triangles.ToArray();
+        mesh.RecalculateNormals();
+        mesh.uv = uvs.ToArray(); // Ajoute les UVs ici après les triangles
+
+        MeshFilter mf = chunkObject.AddComponent<MeshFilter>();
+        MeshRenderer mr = chunkObject.AddComponent<MeshRenderer>();
+        MeshCollider mc = chunkObject.AddComponent<MeshCollider>();
+
+        mf.mesh = mesh;
+        mr.material = chunkMaterial;
+        mc.sharedMesh = mesh;
+    }
+
+
+    int GetVoxel3D(int x, int y, int z, Vector3Int chkPos)
+    {
+        return GetVoxel(x, y, z, chkPos);
+    }
+
+    void AddQuad(List<Vector3> vertices, List<int> triangles, ref int vertexCount, Vector3 pos, Vector3 du, Vector3 dv,
+        bool backFace)
+    {
+        Vector3 v0 = pos;
+        Vector3 v1 = pos + du;
+        Vector3 v2 = pos + du + dv;
+        Vector3 v3 = pos + dv;
+
+        if (backFace)
+        {
+            vertices.Add(v0);
+            vertices.Add(v1);
+            vertices.Add(v2);
+            vertices.Add(v3);
+        }
+        else
+        {
+            vertices.Add(v3);
+            vertices.Add(v2);
+            vertices.Add(v1);
+            vertices.Add(v0);
+        }
+
+        // ➤ Calcul de la répétition UV selon la taille
+        float duLength = du.magnitude;
+        float dvLength = dv.magnitude;
+
+        Vector2 uv0 = new Vector2(0, 0);
+        Vector2 uv1 = new Vector2(duLength, 0);
+        Vector2 uv2 = new Vector2(duLength, dvLength);
+        Vector2 uv3 = new Vector2(0, dvLength);
+
+        if (backFace)
+        {
+            uvs.Add(uv0);
+            uvs.Add(uv1);
+            uvs.Add(uv2);
+            uvs.Add(uv3);
+        }
+        else
+        {
+            uvs.Add(uv3);
+            uvs.Add(uv2);
+            uvs.Add(uv1);
+            uvs.Add(uv0);
+        }
+
+        triangles.Add(vertexCount);
+        triangles.Add(vertexCount + 1);
+        triangles.Add(vertexCount + 2);
+        triangles.Add(vertexCount);
+        triangles.Add(vertexCount + 2);
+        triangles.Add(vertexCount + 3);
+
+        vertexCount += 4;
+    }
+
+
+    int GetVoxel(int x, int y, int z, Vector3Int chkPos)
+    {
+        Vector3Int localPos = new Vector3Int(x, y, z);
+
+        Vector3Int neighborChunk = new Vector3Int(chkPos.x, chkPos.y, chkPos.z);
+
+        if (localPos.x < 0)
+        {
+            neighborChunk.x -= ChunkSize;
+            localPos.x += ChunkSize;
+        }
+        else if (localPos.x >= ChunkSize)
+        {
+            neighborChunk.x += ChunkSize;
+            localPos.x -= ChunkSize;
+        }
+
+        if (localPos.y < 0)
+        {
+            neighborChunk.y -= ChunkHeight;
+            localPos.y += ChunkHeight;
+        }
+        else if (localPos.y >= ChunkHeight)
+        {
+            neighborChunk.y += ChunkHeight;
+            localPos.y -= ChunkHeight;
+        }
+
+        if (localPos.z < 0)
+        {
+            neighborChunk.z -= ChunkSize;
+            localPos.z += ChunkSize;
+        }
+        else if (localPos.z >= ChunkSize)
+        {
+            neighborChunk.z += ChunkSize;
+            localPos.z -= ChunkSize;
+        }
+
+        if (chunks.ContainsKey(neighborChunk))
+        {
+            int[] chunk = chunks[neighborChunk];
+            int index = localPos.x + localPos.y * ChunkSize + localPos.z * ChunkSize * ChunkHeight;
+            return chunk[index];
+        }
+
+        return 0;
+    }
+
+    public void RemoveBlock(Vector3Int position)
+    {
+        Vector3Int chunkPos = new Vector3Int(
+            Mathf.FloorToInt(position.x / ChunkSize) * ChunkSize,
+            Mathf.FloorToInt(position.y / ChunkHeight) * ChunkHeight,
+            Mathf.FloorToInt(position.z / ChunkSize) * ChunkSize
+        );
+
+        if (chunks.ContainsKey(chunkPos))
+        {
+            int[] chunkData = chunks[chunkPos];
+            int localX = position.x - chunkPos.x;
+            int localY = position.y - chunkPos.y;
+            int localZ = position.z - chunkPos.z;
+
+            int index = localX + localY * ChunkSize + localZ * ChunkSize * ChunkHeight;
+            chunkData[index] = 0; // Supprimer le bloc
+
+
+            // Régénérer le mesh pour ce chunk
+            RegenerateChunk(chunkPos,1);
+        }
+    }
+
+    public void AddBlock(Vector3Int position)
+    {
+        Vector3Int chunkPos = new Vector3Int(
+            Mathf.FloorToInt(position.x / ChunkSize) * ChunkSize,
+            Mathf.FloorToInt(position.y / ChunkHeight) * ChunkHeight,
+            Mathf.FloorToInt(position.z / ChunkSize) * ChunkSize
+        );
+
+
+        if (chunks.ContainsKey(chunkPos))
+        {
+            int[] chunkData = chunks[chunkPos];
+            int localX = position.x - chunkPos.x;
+            int localY = position.y - chunkPos.y;
+            int localZ = position.z - chunkPos.z;
+
+            int index = localX + localY * ChunkSize + localZ * ChunkSize * ChunkHeight;
+            chunkData[index] = 1; // Poser un bloc de type 1 (par exemple)
+
+
+            // Régénérer le mesh pour ce chunk
+            RegenerateChunk(chunkPos,1);
+        }
+    }
+
+    void RegenerateChunk(Vector3Int chkPos, int VoxelSize)
+    {
+        // 1. Trouver le chunk existant
+        Transform existingChunk = transform.Find($"Chunk_{chkPos.x}_{chkPos.y}_{chkPos.z}_LOD{VoxelSize}");
+
+        // 2. Supprimer le chunk existant s'il est trouvé
+        if (existingChunk != null)
+        {
+            DestroyImmediate(existingChunk.gameObject); // Utilise DestroyImmediate en mode édition
+            // Destroy(existingChunk.gameObject); // Si en mode jeu
+        }
+        GenerateMesh(chkPos, 1);
+    }
+    
+   
+}
